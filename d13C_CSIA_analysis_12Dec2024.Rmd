@@ -1,0 +1,858 @@
+---
+title: "d13C CSIA Analysis"
+author: "Caila Kucheravy"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+Load packages and prep environment: 
+```{r, echo = TRUE, message = FALSE, results = 'hide', warning = FALSE}
+setwd("~/Documents/Master's/Analysis/CSIA")
+
+library(tidyverse)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(stats)
+library(lubridate)
+library(ggfortify)
+library(brms)
+library(factoextra)
+library(bayesplot)
+library(tidybayes)
+library(cowplot)
+library(MASS)
+```
+
+Load d13C amino acid data & prep for analysis: 
+```{r}
+# Load data including means and se 
+d13C_AA <- read.csv("input/d13C_AA.csv", header = TRUE) 
+
+# Prep data
+d13C_means <- d13C_AA %>% 
+  # Filter for means
+  filter(mean_se == "mean") %>% 
+  # Create new column for "Group"
+  unite(Group, c("Location", "Year"), sep = " ", remove = FALSE) %>% 
+  # Remove AAs not considered: 
+  dplyr::select(!all_of(c("His", "Lys", "Ser", "Tyr")))
+
+# Add a column converting calendar date to julian day
+d13C_means$Sample_date <- as.Date(d13C_means$Sample_date, "%Y-%m-%d")
+
+d13C_means <- d13C_means %>% 
+  mutate(julian_day = yday(d13C_means$Sample_date)) %>% 
+  relocate(julian_day, .after = Sample_date)
+
+# In the data there are same year and across-year duplicates - note that some samples have both within year and across year duplicates
+# Same year duplicate coding: 
+# 0 = no duplicate 
+# 1 = duplicate sample, first collected 
+# 2 = duplicate sample, second collected (excluded in analysis)
+
+# Across year duplicate coding: 
+# 0 = no duplicate 
+# 1 = duplicate sample, first collected (earlier year)
+# 2 = duplicate sample, second collected (sometimes same year as 1 if there is a 3, sometimes different year than 1)
+# 3 = duplicate sample, third collected (sometimes same year as 2, sometimes different year than 1 & 2)
+
+# Filter out same year and across year duplicates 
+d13C_dups_removed <- d13C_means %>% 
+  filter(!duplicate_in_year == "2") %>% 
+  filter(!duplicate_other_year > 1)
+```
+
+## Mean standard deviation 
+
+Calculate the mean standard deviation of replicate samples for methods: 
+```{r}
+d13C_se <- d13C_AA %>% 
+  # Filter for means
+  filter(mean_se == "se") %>% 
+  # Remove samples from Sanikiluaq
+  filter(!Location == "SANIKILUAQ") %>% 
+  # select only AA columns
+  dplyr::select(Ala, Asx, Glx, Gly, Ile, Leu, Lys, Met, Phe, Pro, Thr, Val)
+
+mean_sd = mean(as.matrix(d13C_se[1:80,1:12]), na.rm = TRUE)
+mean_sd
+```
+
+## Data Exploration
+
+Boxplots for all d15N CSIA data.
+
+Re-arrange data:
+```{r}
+# Essential AAs include Ile, Leu, Met, Phe, Val
+# Sometimes threonine, but excluded here because of differences in beluga tissues
+
+# AAs without all values: 
+drop.cols.d13 <- c("Tissue", "UCDavis", "duplicate_in_year", "duplicate_other_year", "duplicate_id", "wgs", "sex")
+
+# Rearrange the data for plotting 
+d13N_rearrange <- d13C_dups_removed %>% 
+  dplyr::select(!all_of(drop.cols.d13)) %>% 
+  pivot_longer(11:21)
+
+# Order AAs for plotting
+d13N_rearrange$name <- factor(d13N_rearrange$name, levels = c("Ile", "Leu", "Met", "Phe", "Val", "Ala", "Asx", "Glx", "Gly", "Pro", "Thr"))
+```
+
+Boxplot by genetic group: 
+```{r}
+# separate by genetic group
+outline_cols <- c("#0072B2", "#E69F00")
+fill_cols <- c("#c6eaff", "#fff1d2")
+
+# On one plot, shading essential amino acids 
+ggplot(data = d13N_rearrange, aes(x = name, y = value, fill = genetic_group, colour = genetic_group)) + 
+  geom_rect(aes(xmin = 0.5, xmax = 5.5, ymin = -Inf, ymax = Inf), fill = "grey93", colour = NA) +
+  geom_boxplot() + 
+  ylab(expression(paste(delta^{13}, "C", " (\u2030)"))) +
+  scale_fill_manual(values = fill_cols, name = "Genetic Group") + 
+  scale_colour_manual(values = outline_cols, name = "Genetic Group") +
+  annotate(geom = "text", label = "Essential AAs", x = 3, y = -2, size = 5) +
+  annotate(geom = "text", label = "Non-essential AAs", x = 8.5, y = -2, size = 5) +
+  theme_classic() + 
+  theme(axis.title.x = element_blank(),
+        axis.text = element_text(size = 14),
+        axis.title = element_text(size = 16),
+        legend.text = element_text(size = 14),
+        legend.title = element_text(size = 16))
+
+#ggsave("plots/boxplots_d13C_allAAs.jpg", dpi = 300, width = 8, height = 5)
+```
+
+Essential amino acids: 
+```{r}
+remove <- c("Tissue", "UCDavis", "csia_sample_id", "Ala", "Asx", "Glx", "Gly", "Pro", "Thr")
+ 
+d13C_AAess <- d13C_means %>% 
+  dplyr::select(!all_of(remove))
+
+# Filter out same year and across year duplicates 
+d13C_AAess_dups_removed <- d13C_AAess %>% 
+  filter(!duplicate_in_year == "2") %>% 
+  filter(!duplicate_other_year > 1)
+```
+
+## Genetic and annual groups:
+
+Run PCA with duplicates removed: 
+```{r}
+# PCA
+d13C_AAess_pca <- prcomp(d13C_AAess_dups_removed[ ,15:19], scale = TRUE, center = TRUE)
+
+# Scree plot: 
+fviz_eig(d13C_AAess_pca)
+
+# Biplot
+biplot <- fviz_pca_biplot(d13C_AAess_pca, 
+                repel = TRUE,
+                col.var = "#FC4E07", # Variables color
+                col.ind = "grey80",  # Individuals color
+                label = "var",
+                title = "")
+
+biplot + 
+  theme_classic() + 
+  theme(axis.text = element_text(size = 14),
+        axis.title = element_text(size = 16),
+        legend.text = element_text(size = 12),
+        legend.title = element_text(size = 12))
+
+#ggsave("plots/d13C_AAess_pca.jpg", dpi = 300, width = 7, height = 5)
+```
+
+Plot to see genetic group:
+```{r}
+genetic_group_plot <- autoplot(d13C_AAess_pca, 
+                               data = d13C_AAess_dups_removed,
+                               colour = "genetic_group",
+                               loadings = TRUE,
+                               loadings.label = TRUE,
+                               loadings.label.repel = TRUE,
+                               frame = TRUE) 
+
+genetic_group_plot + 
+  scale_color_manual(values = outline_cols, name = "Genetic Group") + 
+  scale_fill_manual(values = fill_cols, name = "Genetic Group") + 
+  theme_classic() + 
+  theme(axis.text = element_text(size = 14),
+        axis.title = element_text(size = 16),
+        legend.text = element_text(size = 12),
+        legend.title = element_text(size = 12))
+
+#ggsave("plots/pca_genetic_group_loadings.jpg", dpi = 300, width = 7, height = 5)
+```
+
+Take a look also at PC2 and PC3: 
+```{r}
+dimensions <- d13C_AAess_dups_removed %>% 
+  dplyr::select(Group, DFO_sample_id, genetic_group) %>% 
+  mutate(PC1 = d13C_AAess_pca$x[,1],
+         PC2 = d13C_AAess_pca$x[,2],
+         PC3 = d13C_AAess_pca$x[,3],
+         PC4 = d13C_AAess_pca$x[,4])
+
+ggplot(data = dimensions, aes(x = PC2, y = PC3, colour = genetic_group, fill = genetic_group)) + 
+  geom_point() + 
+  stat_ellipse() +
+  scale_color_manual(values = outline_cols, name = "Genetic Group") + 
+  scale_fill_manual(values = fill_cols, name = "Genetic Group") + 
+  theme_classic()
+```
+
+Plot to see annual groups: 
+```{r}
+group_cols      <- c("#4100b3", "#004ebe", "#0071b3", "#008a9c", "#009e74", "#79a930", "#e6d700", "#e69d00", "#cf6f00", "#b34100", "#b30017", "#98005e")
+group_fill_cols <- c("#dbc7ff", "#d2e4ff", "#c7eaff", "#d7faff", "#c5fff0", "#e6f2d2", "#fffcd2", "#fff1d2", "#ffe9cf", "#ffdbc7", "#ffc7ce", "#ffd3ee")
+
+# Plot by group (location/year)
+group_plot <- autoplot(d13C_AAess_pca, 
+                       data = d13C_AAess_dups_removed,
+                       colour = "Group",
+                       frame = TRUE) 
+
+group_plot + 
+  scale_color_manual(values = group_cols) +
+  scale_fill_manual(values = group_fill_cols) +
+  theme_classic() + 
+  #geom_text_repel(aes(label = DFO_sample_id), size = 1)+
+  theme(axis.text = element_text(size = 14),
+        axis.title = element_text(size = 16),
+        legend.title = element_text(size = 16),
+        legend.text = element_text(size = 12)
+        )
+
+#ggsave("plots/pca_annual_group.jpg", dpi = 600, width = 7.75, height = 5)
+```
+
+Since SPM and NFLD whales show a bit of a subgroup in the genetics data, we can see if they differ ecologically too.
+
+Plot to see genetic sex:
+```{r}
+fill_cols_sex <- c("#ff8b8b", "#8bc5ff")
+outline_cols_sex <- c("#8b0000", "#00468b")
+
+genetic_group_plot <- autoplot(d13C_AAess_pca, 
+                               data = d13C_AAess_dups_removed,
+                               colour = "sex",
+                               frame = TRUE) 
+
+genetic_group_plot + 
+  scale_color_manual(values = outline_cols_sex) + 
+  scale_fill_manual(values = fill_cols_sex) + 
+  theme_classic() + 
+  theme(axis.text = element_text(size = 14),
+        axis.title = element_text(size = 16),
+        legend.text = element_text(size = 12),
+        legend.title = element_text(size = 12))
+
+#ggsave("plots/pca_sex.jpg", dpi = 300, width = 7, height = 5)
+```
+
+## Genetic subgroup - Newfoundland/St Pierre et Miquelon
+
+The genetic PCA showed Newfoundland/St Pierre et Miquelon separating out from the Pond Inlet/Pangnirtung whales, suggesting genetic substructure. However, we only have a few SI samples from that area, so difficult to make any conclusions about diet/distribution from CSIA data. 
+
+Separate out subgroups within the ECAG1 genetic group: 
+```{r}
+# Extract PCs from d13C AEss PCA: 
+princomps <- d13C_AAess_pca$x
+
+# Metadata: 
+metadata_aess <- d13C_AAess_dups_removed %>% 
+  dplyr::select(DFO_sample_id, Group, genetic_group, Location, Year)
+
+# Add metadata: 
+d13C_AEss_princomp1 <- cbind(metadata_aess, princomps)
+
+# Identify individuals in subgroup
+subgroups <- c("St. P & M 2021", "Newfoundland 2022")
+
+# Add column for the diet clusters
+d13C_AEss_princomps <- d13C_AEss_princomp1 %>% 
+  mutate(subgroup = if_else(
+    genetic_group == "ECAG2", "ECAG2", if_else(
+      Group %in% subgroups, "ECAG1 Southern Subgroup", "ECAG1"
+    )
+  )) %>% 
+  relocate(subgroup, .before = Location)
+
+# Check if that worked 
+subgroup_cols <-      c("#0072B2", "#009e73", "#E69F00")
+subgroup_fill_cols <- c("#c6eaff", "#c5ffef", "#fff1d2")
+
+ggplot(d13C_AEss_princomps, aes(x = PC1, y = PC2, color = subgroup)) + 
+  geom_point() + 
+  scale_color_manual(values = subgroup_cols) +
+  theme_classic()
+
+# Save RDS: 
+#saveRDS(d13C_AEss_princomps, "output/d13C_AEss_subgroup_pcs.RDS")
+```
+
+```{r}
+# Read in data if not running whole script
+#d13C_AEss_princomps <- readRDS("output/d13C_AEss_subgroup_pcs.RDS")
+
+# Extract only subgroups and sample ID: 
+subgroups <- d13C_AEss_princomps %>%
+  dplyr::select(DFO_sample_id, subgroup)
+# saveRDS(subgroups, "output/genetic_subgroup_ids.RDS")
+# write.csv(subgroups, "output/genetic_subgroup_ids.csv")
+# subgroups <- readRDS("input/genetic_subgroup_ids.RDS")
+
+# Add subgroup to dataset: 
+d13C_AAess_dups_removed_subgroups <- d13C_AAess_dups_removed %>% 
+  left_join(subgroups, by = "DFO_sample_id") %>% 
+  relocate(subgroup, .after = "genetic_group")
+```
+
+Plot PCA with subgroups:
+```{r}
+subgroup_plot <- autoplot(d13C_AAess_pca, 
+                          data = d13C_AAess_dups_removed_subgroups,
+                          colour = "subgroup",
+                          frame = TRUE) 
+
+subgroup_plot + 
+  scale_color_manual(values = subgroup_cols, name = "Subgroup") + 
+  scale_fill_manual(values = subgroup_fill_cols, name = "Subgroup") + 
+  theme_classic() + 
+  theme(axis.text = element_text(size = 14),
+        axis.title = element_text(size = 16),
+        legend.text = element_text(size = 12),
+        legend.title = element_text(size = 12))
+
+#ggsave("plots/pca_subgroup.jpg", dpi = 300, width = 7, height = 5)
+```
+
+Boxplots:
+```{r}
+d13N_AAess_rearrange <- d13C_AAess_dups_removed_subgroups %>% 
+  pivot_longer(16:20)
+
+ggplot(data = d13N_AAess_rearrange, aes(x = name, y = value, fill = subgroup, colour = subgroup)) + 
+  geom_boxplot() + 
+  ylab(expression(paste(delta^{13}, "C", " (\u2030)"))) +
+  scale_fill_manual(values = subgroup_fill_cols, name = "Subgroup") + 
+  scale_colour_manual(values = subgroup_cols, name = "Subgroup") +
+  theme_classic() + 
+  theme(axis.title.x = element_blank(),
+        axis.text = element_text(size = 14),
+        axis.title = element_text(size = 16),
+        legend.text = element_text(size = 14),
+        legend.title = element_text(size = 16))
+
+#ggsave("plots/boxplot_group.jpg", dpi = 300, width = 8, height = 5)
+```
+
+
+## Inter-annual variation 
+
+Some of these animals were re-sampled in different years. Let's run the PCA again with across-year duplicates to see how the values compare:
+```{r}
+# Colors for 7 duplicates: 
+duplicate_cols <- c("#0071b3", "#696fc6", "#ac64c1", "#df58a5", "#fd5c7a", "#ff7748", "#e69d00")
+
+# Label only certain points
+library(ggrepel)
+
+d13C_AAess_label_duplicates <- d13C_AAess %>% 
+  filter(!duplicate_in_year == 2) %>% 
+  mutate(label1 = if_else(duplicate_other_year > 0, DFO_sample_id, NA)) %>% 
+  mutate(label2 = if_else(duplicate_other_year > 0, duplicate_id, NA))
+
+# Run PCA with across year duplicate samples: 
+d13C_AAess_pca_dups <- prcomp(d13C_AAess_label_duplicates[ ,15:19], scale = TRUE, center = TRUE)
+
+# Plot
+duplicate_pca <- autoplot(d13C_AAess_pca_dups, 
+                          data = d13C_AAess_label_duplicates,
+                          colour = "label2",
+                          label = TRUE,
+                          label.label = "label1",
+                          label.repel = TRUE,
+                          label.size = 3,
+                          frame = FALSE) 
+
+# Make nice
+duplicate_pca + 
+  geom_line(aes(group = duplicate_id, colour = label2)) +
+  scale_color_manual(values = duplicate_cols) + 
+  theme_classic() + 
+  theme(legend.position='none',
+        axis.text = element_text(size = 14),
+        axis.title = element_text(size = 16)) 
+
+#ggsave("plots/pca_duplicate.jpg", dpi = 300, width = 5.6, height = 5)
+```
+
+Some of the genetic duplicates are showing different grouping in different years. 
+
+# Stats
+
+## Linear discriminant analysis 
+
+Standardize data: 
+```{r}
+# Scale data:
+scaled_data <- as.data.frame(scale(d13C_AAess_dups_removed[,15:19]))
+
+# Add sample IDs back to standardized data: 
+scaled_data$DFO_sample_id <- d13C_AAess_dups_removed$DFO_sample_id
+
+# Join scaled data with metadata sheet 
+d13C_AAess_scaled <- d13C_AAess_dups_removed %>% 
+  dplyr::select(Group, DFO_sample_id, genetic_group) %>% 
+  left_join(scaled_data, by = "DFO_sample_id")
+```
+
+Discriminant analysis: 
+```{r}
+# Run discriminant analysis; genetic groups by the 5 AAess
+d13C_AAess_lda <- lda(data = d13C_AAess_scaled,
+                            genetic_group ~ Ile + Leu + Met + Phe + Val)
+
+# See results 
+d13C_AAess_lda
+```
+
+Extract fitted (predicted) values: 
+```{r}
+d13C_AAess_lda_pred <- predict(d13C_AAess_lda, d13C_AAess_scaled)
+```
+
+See if the LDA correctly categorized the data: 
+```{r}
+class <- d13C_AAess_lda_pred$class
+table <- table(d13C_AAess_scaled$genetic_group, class)
+table
+
+classifications <- as.data.frame(cbind(d13C_AAess_scaled$DFO_sample_id, d13C_AAess_scaled$genetic_group, class))
+```
+
+GRNL-KW-2021-01 is the one that was misclassified. 
+
+Plot: 
+```{r}
+plot(d13C_AAess_lda)
+
+# Check calculations from the fitted model, and equations
+library(ggplot2)
+library(ggpubr)
+
+outline_cols <- c("#0072B2", "#E69F00")
+fill_cols <- c("#c6eaff", "#fff1d2")
+
+# Using the predicted values from the model object
+d13C_AAess_lda_pred_x <- data.frame(d13C_AAess_lda_pred$x)
+
+d13C_AAess_lda_pred_x$genetic_group <- d13C_AAess_scaled$genetic_group
+
+ggplot(d13C_AAess_lda_pred_x, 
+                 aes(x=genetic_group, y=LD1, colour=genetic_group, fill = genetic_group)) + 
+  geom_violin() +
+  geom_jitter(size = 0.5, width = 0.3) + 
+  scale_color_manual(values = outline_cols) + 
+  scale_fill_manual(values = fill_cols) +
+  theme_classic() + 
+  theme(axis.title.x = element_blank(),
+        axis.text = element_text(size = 14),
+        axis.title = element_text(size = 16),
+        legend.position = "none")
+
+# ggsave("plots/LDA_boxplots.jpg", dpi = 300, width = 6, height = 5)
+
+ggplot(d13C_AAess_lda_pred_x, 
+                 aes(x = LD1, color = genetic_group, fill = genetic_group)) + 
+  geom_histogram(position = "identity") +
+  scale_color_manual(values = outline_cols) +
+  scale_fill_manual(values = fill_cols) +
+  theme_classic() + 
+  theme(axis.title.x = element_blank(),
+        axis.text = element_text(size = 14),
+        axis.title = element_text(size = 16),
+        legend.position = c(0.9, 0.9))
+```
+
+
+## Bayesian models
+
+Let's test whether the genetic groups differ in AAess using a multivariate model with brms (equivalent of MANOVA).
+Vignette here: https://cran.r-project.org/web/packages/brms/vignettes/brms_multivariate.html
+More help: https://solomonkurz.netlify.app/blog/2019-02-16-bayesian-correlations-let-s-talk-options/
+
+Use mvbind to tell brms that all AAess variables should be response variables.
+Use set_rescor(TRUE) to fit model with residual correlations.
+
+### Models
+
+Model 1 - genetic_group:
+```{r}
+# Define the model
+genetic_group_model <- bf(mvbind(Ile, Leu, Met, Phe, Val) ~ genetic_group) + set_rescor(TRUE)
+
+# # Fit the model (on server)
+# d13C_Aess__genetic_group <- brm(genetic_group_model,
+#                                 data = d13C_AAess_dups_removed,
+#                                 warmup = 20000,
+#                                 iter = 50000,
+#                                 chains = 3,
+#                                 init = "random",
+#                                 cores = 2)
+# 
+# # Save the model (on server)
+# saveRDS(d13C_Aess__genetic_group, "output/d13C_Aess__genetic_group.rds")
+
+# Load model and view results: 
+d13C_Aess__genetic_group <- readRDS("server/d13C_Aess__genetic_group.rds")
+summary(d13C_Aess__genetic_group)
+```
+
+
+Model 2 - genetic group + year:
+```{r}
+# Define the model
+genetic_group_year_model <- bf(mvbind(Ile, Leu, Met, Phe, Val) ~ genetic_group + Year) + set_rescor(TRUE)
+
+# # Fit the model (on server)
+# d13C_Aess__genetic_group_year <- brm(genetic_group_year_model,
+#                                      data = d13C_AAess_dups_removed,
+#                                      warmup = 20000,
+#                                      iter = 50000,
+#                                      chains = 3,
+#                                      init = "random",
+#                                      cores = 2)
+# 
+# # Save the model (on server)
+# saveRDS(d13C_Aess__genetic_group_year, "output/d13C_Aess__genetic_group_year.rds")
+
+# Load model and view results: 
+# d13C_Aess__genetic_group_year <- readRDS("server/d13C_Aess__genetic_group_year.rds")
+# summary(d13C_Aess__genetic_group_year)
+```
+
+Here year is significant for every AA. But I think mostly influenced by the 2020 subgroup. 
+
+Model 3.1 - subgroup:
+```{r}
+# Define the model
+subgroup_model <- bf(mvbind(Ile, Leu, Met, Phe, Val) ~ subgroup) + set_rescor(TRUE)
+
+# # Fit the model (on server)
+# d13C_Aess__subgroup <- brm(subgroup_model,
+#                            data = d13C_AAess_dups_removed_subgroups,
+#                            warmup = 20000,
+#                            iter = 50000,
+#                            chains = 3,
+#                            init = "random",
+#                            cores = 2)
+# 
+# # Save the model (on server)
+# saveRDS(d13C_Aess__subgroup, "output/d13C_Aess__subgroup.rds")
+
+# Load model and view results: 
+d13C_Aess__subgroup <- readRDS("server/d13C_Aess__subgroup.rds")
+summary(d13C_Aess__subgroup)
+```
+
+
+Model 3.2 - subgroup + year:
+```{r}
+# Define the model
+subgroup_year_model <- bf(mvbind(Ile, Leu, Met, Phe, Val) ~ subgroup + Year) + set_rescor(TRUE)
+
+# # Fit the model (on server)
+# d13C_Aess__subgroup_year <- brm(subgroup_year_model,
+#                                 data = d13C_AAess_dups_removed_subgroups,
+#                                 warmup = 20000,
+#                                 iter = 50000,
+#                                 chains = 3,
+#                                 init = "random",
+#                                 cores = 2)
+# 
+# # Save the model (on server)
+# saveRDS(d13C_Aess__subgroup_year, "output/d13C_Aess__subgroup_year.rds")
+
+# Load model and view results: 
+# d13C_Aess__subgroup_year <- readRDS("server/d13C_Aess__subgroup_year.rds")
+# summary(d13C_Aess__subgroup_year)
+```
+
+Model 4 - genetic group + Julian day:
+```{r}
+# Define the model
+julian_day_model <- bf(mvbind(Ile, Leu, Met, Phe, Val) ~ genetic_group + julian_day) + set_rescor(TRUE)
+
+# # Fit the model (on server)
+# d13C_Aess__julian_day <- brm(julian_day_model,
+#                              data = d13C_AAess_dups_removed,
+#                              warmup = 20000,
+#                              iter = 50000,
+#                              chains = 3,
+#                              init = "random",
+#                              cores = 2)
+# 
+# # Save the model (on server)
+# saveRDS(d13C_Aess__julian_day, "output/d13C_Aess__julian_day.rds")
+
+# Load model and view results: 
+d13C_Aess__julian_day <- readRDS("server/d13C_Aess__julian_day.rds")
+summary(d13C_Aess__julian_day)
+```
+
+No relationship with Julian Day. 
+
+Model 5 - location/year group within ECAG1:
+```{r}
+# Remove the ECAG2 group, east greenland, and st pierre 2021, and pang 2021 (since only one left after removing duplicates)
+group_data <- d13C_AAess_dups_removed %>% 
+  filter(!genetic_group == "ECAG2") %>% 
+  filter(!Group %in% c("St. P & M 2021", "Newfoundland 2022", "Ittoqqortoormiit 2021"))
+
+# Define the model
+group_model <- bf(mvbind(Ile, Leu, Met, Phe, Val) ~ Group) + set_rescor(TRUE)
+
+# # Fit the model (on server)
+# d13C_Aess__group <- brm(group_model,
+#                         data = group_data,
+#                         warmup = 20000,
+#                         iter = 50000,
+#                         chains = 3,
+#                         init = "random",
+#                         cores = 2)
+# 
+# # Save the model (on server)
+# saveRDS(d13C_Aess__group, "output/d13C_Aess__group.rds")
+
+# Load model and view results: 
+d13C_Aess__group <- readRDS("server/d13C_Aess__group.rds")
+summary(d13C_Aess__group)
+```
+
+
+Model 6 - genetic group + sex:
+```{r}
+# Define the model
+sex_model <- bf(mvbind(Ile, Leu, Met, Phe, Val) ~ genetic_group + sex) + set_rescor(TRUE)
+
+# # Fit the model (on server)
+# d13C_Aess__sex <- brm(sex_model,
+#                       data = d13C_AAess_dups_removed,
+#                       warmup = 20000,
+#                       iter = 50000,
+#                       chains = 3,
+#                       init = "random",
+#                       cores = 2)
+# 
+# # Save the model (on server)
+# saveRDS(d13C_Aess__sex, "output/d13C_Aess__sex.rds")
+
+# Load model and view results: 
+d13C_Aess__sex <- readRDS("server/d13C_Aess__sex.rds")
+summary(d13C_Aess__sex)
+```
+
+None of the AAs differ by sex. 
+
+### Diagnostics & Posterior Predictive Checks
+
+Model to be checked: 
+```{r}
+# model to evaluate 
+model <- d13C_Aess__genetic_group   
+# model name
+model_name <- "d13C_Aess__genetic_group"
+# Glx-Phe or Thr-Phe
+values <- c("Ile", "Leu", "Met", "Phe", "Val")               
+# genetic_group or subgroup
+group <- "genetic_group"            
+```
+
+
+Check Gelman-Rubin Diagnostics: 
+```{r}
+gr_diag <- brms::rhat(model)
+write.csv(gr_diag, file = paste("output/gelmanrubin_", model_name, ".csv", sep=""))
+```
+
+
+Traceplot and posterior density plots: 
+```{r}
+# Set colour palette for bayesplot
+color_scheme_set("blue")
+
+# Set parameters:
+pars_intercept    = c("b_Ile_Intercept", "b_Leu_Intercept", "b_Met_Intercept", "b_Phe_Intercept", "b_Val_Intercept")
+pars_geneticgroup = c("b_Ile_genetic_groupECAG2", "b_Leu_genetic_groupECAG2", "b_Met_genetic_groupECAG2", "b_Phe_genetic_groupECAG2", "b_Val_genetic_groupECAG2")
+#pars_subgroup1    = c("b_Ile_subgroupECAG1_2", "b_Leu_subgroupECAG1_2", "b_Met_subgroupECAG1_2", "b_Phe_subgroupECAG1_2", "b_Val_subgroupECAG1_2")
+#pars_subgroup2    = c("b_Ile_subgroupECAG2", "b_Leu_subgroupECAG2", "b_Met_subgroupECAG2", "b_Phe_subgroupECAG2", "b_Val_subgroupECAG2")
+pars_sigma        = c("sigma_Ile", "sigma_Leu", "sigma_Met", "sigma_Phe", "sigma_Val")
+
+# Traceplots:
+# jpeg(filename = paste("plots/", model_name, "__traceplot_intercept.jpeg"), units="in", width = 8, height = 5, res = 400)
+mcmc_trace(model, pars = pars_intercept, facet_args = list(ncol = 1, strip.position = "left"))
+# dev.off()
+
+# jpeg(filename = paste("plots/", model_name, "__traceplot_geneticgroup.jpeg"), units="in", width = 8, height = 5, res = 400)
+mcmc_trace(model, pars = pars_geneticgroup, facet_args = list(ncol = 1, strip.position = "left"))
+# dev.off()
+
+# jpeg(filename = paste("plots/", model_name, "__traceplot_sigma.jpeg"), units="in", width = 8, height = 5, res = 400)
+mcmc_trace(model, pars = pars_sigma, facet_args = list(ncol = 1, strip.position = "left"))
+# dev.off()
+
+# Density plots: 
+# jpeg(filename = paste("plots/", model_name, "__densplot_intercept.jpeg"), units="in", width = 8, height = 2, res = 400)
+mcmc_dens_overlay(model, pars = pars_intercept, facet_args = list(nrow = 1))
+# dev.off()
+
+# jpeg(filename = paste("plots/", model_name, "__densplot_geneticgroup.jpeg"), units="in", width = 8, height = 2, res = 400)
+mcmc_dens_overlay(model, pars = pars_geneticgroup, facet_args = list(nrow = 1))
+# dev.off()
+
+# jpeg(filename = paste("plots/", model_name, "__densplot_sigma.jpeg"), units="in", width = 8, height = 2, res = 400)
+mcmc_dens_overlay(model, pars = pars_sigma, facet_args = list(nrow = 1))
+# dev.off()
+```
+
+Plot coefficients: 
+```{r}
+effects <- data.frame(fixef(model))
+
+ggplot(effects) + 
+  geom_vline(xintercept = 0, lty = 2, col = "#0071b3") +
+  geom_point(aes(x = Estimate, y = rownames(effects))) + 
+  geom_segment(aes(x = Q2.5, xend = Q97.5, y = rownames(effects), yend = rownames(effects))) + 
+  theme_classic() + 
+  theme(axis.title.y = element_blank())
+
+#ggsave(paste("plots/", model_name, "__coefplot.jpeg"), dpi = 300, width = 8, height = 5)
+
+effects_intercept <- effects %>% 
+  filter(grepl("Intercept", rownames(effects)))
+
+ggplot(effects_intercept) + 
+  geom_vline(xintercept = 0, lty = 2, col = "darkred") +
+  geom_point(aes(x = Estimate, y = rownames(effects_intercept))) + 
+  geom_segment(aes(x = Q2.5, xend = Q97.5, y = rownames(effects_intercept), yend = rownames(effects_intercept))) + 
+  theme_classic() + 
+  theme(axis.title.y = element_blank())
+
+effects_other <- effects %>% 
+  filter(!grepl("Intercept", rownames(effects)))
+
+ggplot(effects_other) + 
+  geom_vline(xintercept = 0, lty = 2, col = "darkred") +
+  geom_point(aes(x = Estimate, y = rownames(effects_other))) + 
+  geom_segment(aes(x = Q2.5, xend = Q97.5, y = rownames(effects_other), yend = rownames(effects_other))) + 
+  theme_classic() + 
+  theme(axis.title.y = element_blank())
+```
+
+Conditional effects plot: 
+```{r}
+conditional_effects(model)
+```
+
+Autocorrelation plot: 
+```{r}
+mcmc_acf(model, pars = pars_geneticgroup)
+#ggsave(paste("plots/", model_name, "__autocorrplot.jpeg"), dpi = 300, width = 8, height = 5)
+```
+
+Check model fit with posterior predictive check: 
+
+PP check 1, density overlap plot:
+```{r}
+AAs <- c("Ile", "Leu", "Met", "Phe", "Val")
+
+for (AA in AAs) {
+  pp_check <- pp_check(model, 
+                       type = "dens_overlay_grouped",
+                       ndraws = 100, 
+                       group = group,
+                       resp = AA)
+  # show plot
+  print(pp_check)
+  # save plot
+  #ggsave(paste("plots/", model_name, "_", AA, "__ppcheck_densoverlay.jpeg", sep = ""), dpi = 300, width = 8, height = 5)
+}
+```
+
+PP check 2, mean grouped: 
+```{r, warning=FALSE}
+for (AA in AAs) {
+  pp_check2 <- pp_check(model, 
+         type = "stat_grouped", 
+         stat = "mean",
+         ndraws = 100, 
+         group = group,
+         resp = AA)
+  # Show plot:
+  print(pp_check2)
+  # Save plot:
+  #ggsave(paste("plots/", model_name, "_", AA, "__ppcheck_meangrouped.jpeg", sep = ""), dpi = 300, width = 8, height = 5)
+}
+```
+
+PP check 3 - stat 2d with mean and se:
+```{r, warning=FALSE}
+for (AA in AAs) {
+  pp_check3 <- pp_check(model, 
+         type = "stat_2d", 
+         stat = c("mean", "sd"),
+         resp = AA)
+  # Show plot:
+  print(pp_check3)
+  # Save plot:
+  #ggsave(paste("plots/", model_name, "_", AA, "__ppcheck_stat2d.jpeg", sep = ""), dpi = 300, width = 8, height = 5)
+}
+```
+
+Visualize the d13C values per group with associated uncertainty:
+```{r}
+# Couldn't figure out how to do this one in a for loop, so have to enter the AAs manually
+
+# AAs <- c("Ile", "Leu", "Met", "Phe", "Val")
+
+plot_spreaddraws <- model %>%
+  # spread 1000 posterior samples for 2 parameters in wide format
+  spread_draws(b_Phe_Intercept, b_Phe_genetic_groupECAG2, ndraws = 1000, seed = 123) %>%
+  # calculate average numbers and convert to long format for visualisation
+  mutate(ECAG1 = b_Phe_Intercept,
+         ECAG2 = b_Phe_Intercept + b_Phe_genetic_groupECAG2) %>%
+  pivot_longer(cols = c("ECAG1", "ECAG2"), 
+               names_to = "genetic_group",                
+               values_to = "Phe") %>%
+  # visualise via ggplot()
+  ggplot(aes(y = Phe, x = genetic_group, color = genetic_group, fill = genetic_group)) +
+    stat_eye(point_interval = "median_qi", .width = c(0.6, 0.9)) + 
+    scale_color_manual(values = outline_cols) +
+    scale_fill_manual(values = fill_cols) +
+    theme_classic() + 
+    theme(legend.position = "none", 
+          axis.title.x = element_blank())
+  
+# Show plot:
+print(plot_spreaddraws)
+# Save plot:
+#ggsave(paste("plots/", model_name, "_Phe__spreaddraws.jpeg", sep = ""), dpi = 300, width = 7, height = 5)
+```
+
+Hypothesis test of whether the two groups are different: 
+```{r}
+hypothesis <- hypothesis(d13C_Aess__genetic_group, "Ile_genetic_groupECAG2 = 0", alpha = 0.05)
+hypothesis
+plot(hypothesis)
+```
+
+
+
+
+

@@ -1,0 +1,181 @@
+---
+title: "KW Population Analysis"
+author: "Caila Kucheravy"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+Examine population structure using PCA. Script from E. de Greef, help from the PCAdapt vignette: https://bcm-uga.github.io/pcadapt/articles/pcadapt.html. 
+
+Prep the environment: 
+```{r setup, results = FALSE}
+setwd("~/Dropbox/killer_whale_genomics/snps3/chp_2_gen_snps")
+
+library(pcadapt)
+library(ggplot2)
+library(ggrepel)
+library(patchwork)
+library(dplyr)
+library(StAMPP)
+library(vcfR)
+```
+
+Load data and sample info: 
+```{r, results = FALSE}
+sample_info <- read.csv("chp2_killerwhale_genomics_sample_info_round3_kinship_removed.csv", header=T)
+```
+
+Remove duplicates & close kin (based on kinship file): 
+```{r}
+sample_info <- sample_info %>% 
+  filter(!remove_duplicates == "x") %>% 
+  filter(!remove_closekin == "x") 
+```
+
+Verify that snp file IDs are the in the same order as the metadata file:
+```{r}
+snp_IDs <- read.table("killerwhale3_snps.ID.filter1.miss.biallel.min100kb.autosomes.hwe.maf.LDprunedr08.kinship0.65_removed.recode.fam")
+snp_IDs$vcf_ID <- sample_info$genome_sample_ID
+snp_IDs$all_equal <- snp_IDs$V1==snp_IDs$vcf_ID #column should all say "TRUE"
+snp_IDs$all_equal
+```
+
+## PCA
+
+Load SNP data with pcadapt:
+```{r}
+snp_data_pca <- read.pcadapt("killerwhale3_snps.ID.filter1.miss.biallel.min100kb.autosomes.hwe.maf.LDprunedr08.kinship0.65_removed.recode.bed", type = "bed")
+```
+
+Run pcadapt, setting k-value to the desired number of eigenvectors to be produced: 
+```{r}
+pca <- pcadapt(input = snp_data_pca, K = 18)
+```
+
+Plot screeplot and PCA: 
+```{r, warning = FALSE}
+# Quick Screeplot: 
+plot(pca, option = "screeplot")
+
+# Quick biplot: 
+plot(pca, option = "scores", pop = sample_info$location_name, labels = sample_info$genome_sample_ID)
+```
+
+Examine PCA scores, loadings, and z-scores, and calculate proportion variance for first few eigenvectors: 
+```{r}
+# scores:
+scores <- as.data.frame(pca$scores)
+
+# loadings: 
+loadings <- as.data.frame(pca$loadings)
+
+# z-scores: 
+z_scores <- as.data.frame(pca$zscores)
+
+# proportion variance
+proportion <- as.data.frame(pca$singular.values)
+proportion$squared <- proportion$`pca$singular.values`* proportion$`pca$singular.values`
+prop_var <- as.data.frame(proportion$squared)
+PC1_proportion <- (round(prop_var[1,], digits=4))*100
+PC2_proportion <- (round(prop_var[2,], digits=4))*100
+```
+
+Make screeplot nicer: 
+```{r, warning = FALSE}
+prop_var$num <- 1:nrow(prop_var)
+
+scree <- ggplot(data=prop_var, aes(x=num, y=prop_var$`proportion$squared`)) +
+  geom_point(col = "#0071b3") +
+  geom_line(col = "#0071b3") +
+  scale_y_continuous(breaks = seq(0,0.16,0.02)) +
+  ylab("Proportion of explained variance") +
+  xlab("PC") + 
+  theme_classic() + 
+  theme(axis.title = element_text(size = 16),
+        axis.text = element_text(size = 14))
+
+scree
+
+#ggsave("scree_plot_pca_allSamples.png", plot = scree, width=6, height=4.5, dpi=300)
+```
+
+Make nice PCA: 
+```{r, warning = FALSE}
+# Order locations for plotting: 
+sample_info$location_name <- factor(sample_info$location_name, levels = c("Mittimatalik", "Pangnirtung", "Newfoundland", "St Pierre et Miquelon", "Ittoqqortoormiit, East Greenland", "Tasiilaq, East Greenland", "Naujaat", "Nuuk, West Greenland"))
+
+# Set cols: 
+#          Pond       Pang       Nfld       SP&M       SCores    Tasiilaq   Naujaat    Nuuk             
+cols <- c("#004c78", "#0071b3", "#0096ee", "#3db8ff", "#8cd5ff","#ab7500", "#e69d00", "#ffbf35")
+
+evec <- cbind(sample_info$genome_sample_ID, scores)
+colnames(evec)[1] <- "sample"
+
+ggplot(data=evec, aes(x=V1,y=V2))+
+  geom_point(aes(color=sample_info$location_name),size=2, alpha=0.9)+
+  theme_classic()+
+  xlab(paste("PC1 (", PC1_proportion, "%)", sep=""))+
+  ylab(paste("PC2 (", PC2_proportion, "%)", sep=""))+
+  #geom_text_repel(aes(label=sample_info$genome_sample_ID), size=2)+
+  scale_color_manual(values = cols, name = "Region") + 
+  theme(axis.title = element_text(size = 16),
+        axis.text = element_text(size = 14),
+        legend.text = element_text(size = 12),
+        legend.title = element_text(size = 14))
+
+#ggsave("pca_closekinremoved_Dec2024.png", width=8, height=4.5, dpi=300)
+```
+
+We see the two populations as before, though appears to be some grouping of the SPM & Newfoundland whales, and then the Scoresbysund whales.
+
+Assign individuals to populations based on the PCA:
+```{r}
+pc1_for_grouping <- evec %>% 
+  dplyr::select(sample, V1) %>% 
+  mutate(genetic_group = if_else(V1 > -0.1, "ECAG1", "ECAG2")) %>% 
+  rename("genome_sample_ID" = "sample")
+
+sample_info_genetic_group <- sample_info %>% 
+  left_join(pc1_for_grouping, by = "genome_sample_ID")
+# saveRDS(sample_info_genetic_group, "sample_info_genetic_groups.rds")
+```
+
+
+## FST
+
+This section run on bio server.
+
+Load snps with vcfR: 
+```{r}
+# # Populate the ID column of VCF data:
+# snps <- read.vcfR("killerwhale3_snps.ID.filter1.miss.biallel.min100kb.autosomes.hwe.maf.LDprunedr08.kinship0.65_removed.recode.vcf")
+# 
+# # add IDs:
+# snps <- addID(snps, sep = "_")
+# 
+# # Convert vcfR objects to objects supported by other R packages (such as StAMPP)
+# snp_data_fst <- vcfR2genlight(snps)
+```
+
+Add pop info to the snp data: 
+```{r}
+# sample_info <- readRDS("sample_info_genetic_groups.rds")
+# snp_data_fst@pop <- as.factor(sample_info$genetic_group)
+# fst_snps <- snp_data_fst
+```
+
+Calculate fst: 
+```{r}
+# Calculate Fst - run on server
+# kws_fst <- stamppFst(fst_snps, nboots = 100, percent = 95, nclusters = 45)
+# saveRDS(kws_fst, "kw_fst.rds")
+# write.csv(kws_fst, "kw_fst.csv")
+
+kws_fst <- readRDS("kw_fst.rds")
+kws_fst
+```
+
+
+
+
+
